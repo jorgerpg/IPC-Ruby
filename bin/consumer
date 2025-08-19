@@ -1,0 +1,85 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+require "json"
+require "logger"
+
+$stdout.sync = true                                   # <<< PRINTA NA HORA NO TERMINAL
+
+FIFO = "tmp/ipc_fifo"
+LOG  = Logger.new("logs/consumer.log", 10, 1024 * 1024)
+
+# tornar o arquivo de log síncrono também (sem buffer):
+begin
+  logdev = LOG.instance_variable_get(:@logdev)
+  logdev.dev.sync = true if logdev && logdev.dev.respond_to?(:sync=)  # <<< LOG IMEDIATO
+rescue
+  # ignora se a API interna do Logger mudar em outra versão
+end
+
+abort("FIFO não encontrado: #{FIFO}") unless File.pipe?(FIFO)
+
+$paused = false
+$processed = 0
+
+def process_message(msg)
+  raw = msg["raw"].to_s
+
+  if raw =~ /\A\s*(-?\d+(?:\.\d+)?)\s*([+\-*\/])\s*(-?\d+(?:\.\d+)?)\s*\z/
+    a = $1.to_f; op = $2; b = $3.to_f
+    result = case op
+             when "+" then a + b
+             when "-" then a - b
+             when "*" then a * b
+             when "/" then (b.zero? ? Float::NAN : a / b)
+             end
+    return { kind: "arith", expr: raw, result: result }
+  end
+
+  if raw =~ /\Asum\s+([\d,\s\.]+)\z/i
+    nums = $1.split(/[\s,]+/).reject(&:empty?).map!(&:to_f)
+    return { kind: "sum", list: nums, result: nums.sum }
+  end
+
+  if raw =~ /\Aupper\s+(.+)\z/i
+    return { kind: "upper", from: $1, result: $1.upcase }
+  end
+  if raw =~ /\Alower\s+(.+)\z/i
+    return { kind: "lower", from: $1, result: $1.downcase }
+  end
+  if raw =~ /\Areverse\s+(.+)\z/i
+    return { kind: "reverse", from: $1, result: $1.reverse }
+  end
+  if raw =~ /\Acount_words\s+(.+)\z/i
+    words = $1.split(/\s+/)
+    return { kind: "count_words", from: $1, result: words.size }
+  end
+
+  { kind: "unknown", raw: raw }
+end
+
+def log_and_print(hash)
+  LOG.info(hash)
+  puts "[proc] #{hash}"         # <<< COM $stdout.sync = true, sai na hora
+end
+
+File.open(FIFO, "r") do |io|
+  while (line = io.gets)
+    begin
+      msg = JSON.parse(line)
+      if $paused
+        log_and_print(kind: "paused", dropped: msg["raw"])
+        next
+      end
+
+      result = process_message(msg)
+      $processed += 1
+      log_and_print(id: msg["id"], ts: Time.now.utc.iso8601, input: msg["raw"], **result)
+    rescue JSON::ParserError
+      log_and_print(kind: "error", reason: "json_parse_error", line: line)
+    rescue => e
+      log_and_print(kind: "error", reason: e.class.name, message: e.message)
+    end
+  end
+end
+
+puts "Consumer finalizado. Processados: #{$processed}"

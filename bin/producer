@@ -1,0 +1,84 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+require "json"
+
+FIFO = "tmp/ipc_fifo"
+abort("FIFO não encontrado: #{FIFO}") unless File.pipe?(FIFO)
+
+puts "== Produtor (digite uma mensagem por linha; 'quit' para sair) =="
+puts "Exemplos numéricos:  '12 + 5', '7*3', '10 / 2', '9 - 4'"
+puts "Exemplos string:     'upper Olá mundo', 'reverse abc', 'count_words foo bar baz'"
+puts "Outros exemplos:     'sum 1,2,3,4'"
+
+# --- define a função antes de chamar ---
+def open_fifo_for_write
+  tries = 0
+  begin
+    File.open(FIFO, "w")
+  rescue Errno::ENXIO, Errno::EPIPE
+    tries += 1
+    warn "[produtor] sem leitor ainda... tentativa #{tries}"
+    sleep 0.5
+    retry if tries < 10
+    abort "[produtor] não há leitor (consumer); abortando após #{tries} tentativas."
+  end
+end
+
+# Escreve uma linha JSON no FIFO sem bloquear.
+# Usa write_nonblock e IO.select para esperar quando o pipe estiver cheio.
+def write_json_line(io, line, timeout: 1.0, max_retries: 5)
+  pending = line.dup
+  retries = 0
+
+  loop do
+    begin
+      written = io.write_nonblock(pending)
+      return if written == pending.bytesize
+      pending = pending.byteslice(written..-1)
+    rescue IO::WaitWritable, Errno::EAGAIN
+      warn "[produtor] pipe cheio; aguardando disponibilidade..."
+      ready = IO.select(nil, [io], nil, timeout)
+      unless ready
+        retries += 1
+        warn "[produtor] ainda bloqueado (tentativa #{retries}/#{max_retries})"
+        raise Timeout::Error, "timeout escrevendo no pipe" if retries >= max_retries
+      end
+      retry
+    end
+  end
+end
+
+# agora sim podemos chamar
+io = open_fifo_for_write
+io.sync = true   # saída imediata
+
+count = 0
+loop do
+  print "> "
+  line = STDIN.gets
+  break if line.nil?
+
+  line = line.strip
+  break if line.downcase == "quit"
+  next if line.empty?
+
+  payload = {
+    id: count += 1,
+    raw: line,
+    ts: Time.now.utc.iso8601,
+    rnd: rand(1..10_000)
+  }
+
+  begin
+    write_json_line(payload.to_json)
+    $stdout.puts "[enviado] #{payload}"
+  rescue Errno::EPIPE
+    warn "[produtor] consumidor fechou o pipe (EPIPE). tente iniciar o consumer e retomar."
+    io = open_fifo_for_write
+    io.sync = true
+    retry
+  end
+end
+
+io.close unless io.closed?
+puts "Produtor finalizado."
