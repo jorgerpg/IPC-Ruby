@@ -32,9 +32,9 @@ IPC (**Inter-Process Communication**) using a **named pipe (FIFO)** on Linux:
   # ruby-build plugin
   git clone https://github.com/rbenv/ruby-build.git ~/.rbenv/plugins/ruby-build
 
-  # Install and select Ruby (e.g., 3.3.0)
-  rbenv install 3.3.0
-  rbenv global 3.3.0
+  # Install and select Ruby (e.g., 3.4.5)
+  rbenv install 3.4.5
+  rbenv global 3.4.5
   ruby -v
   ```
 
@@ -237,15 +237,3 @@ I, [2025-08-18T01:23:46.012345 #1234]  INFO -- : {:id=>2, :ts=>"2025-08-18T01:23
 * **Producer** opens FIFO for writing; sends **JSON** per line; uses `write_nonblock` + `IO.select` to handle a **full pipe**; handles `EPIPE` when the consumer dies.
 * **Consumer** reads lines (`io.gets`), parses JSON, matches commands with **regex**, prints and logs with `Logger`.
 * **Signals** via `Signal.trap` provide **pause/resume**, **buffer clear**, and **graceful shutdown**.
-
----
-
-## 11) Tests (optional)
-
-If you initialized RSpec:
-
-```bash
-bundle exec rspec
-```
-
-> You can add unit specs for `process_message` and counters/metrics.

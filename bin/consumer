@@ -113,11 +113,18 @@ def drain_buffer
 end
 
 File.open(FIFO, "r") do |io|
+  io.sync = true # garante que a leitura seja imediata
+  # loop responsivo a sinais: checa $shutdown a cada ~200ms
   while !$shutdown
-    line = io.gets
-    break if line.nil? || $shutdown
-    handle_line(line)
-    drain_buffer unless $paused || $shutdown
+    # espera até 0.2s por dados; se nada chegar, volta e checa $shutdown
+    readable, = IO.select([io], nil, nil, 0.2)
+
+    if readable
+      line = io.gets
+      break if line.nil? || $shutdown  # writer fechou ou sinal chegou
+      handle_line(line)
+      drain_buffer unless $paused || $shutdown
+    end
   end
 end
 

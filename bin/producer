@@ -1,16 +1,12 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 require "json"
+require "time"
 
 FIFO = "tmp/ipc_fifo"
 abort("FIFO não encontrado: #{FIFO}") unless File.pipe?(FIFO)
 
-puts "== Produtor (digite uma mensagem por linha; 'quit' para sair) =="
-puts "Exemplos numéricos:  '12 + 5', '7*3', '10 / 2', '9 - 4'"
-puts "Exemplos string:     'upper Olá mundo', 'reverse abc', 'count_words foo bar baz'"
-puts "Outros exemplos:     'sum 1,2,3,4'"
-
-# --- define a função antes de chamar ---
+# Abre o FIFO para escrita com retentativa se não houver consumidor ainda.
 def open_fifo_for_write
   tries = 0
   begin
@@ -24,8 +20,7 @@ def open_fifo_for_write
   end
 end
 
-# Escreve uma linha JSON no FIFO sem bloquear.
-# Usa write_nonblock e IO.select para esperar quando o pipe estiver cheio.
+# Escreve sem bloquear; espera o pipe ficar disponível quando estiver cheio.
 def write_json_line(io, line, timeout: 1.0, max_retries: 5)
   pending = line.dup
   retries = 0
@@ -48,9 +43,14 @@ def write_json_line(io, line, timeout: 1.0, max_retries: 5)
   end
 end
 
-# agora sim podemos chamar
+puts "== Produtor (digite uma mensagem por linha; 'quit' para sair) =="
+puts "Exemplos numéricos:  '12 + 5', '7*3', '10 / 2', '9 - 4'"
+puts "Exemplos string:     'upper Olá mundo', 'reverse abc', 'count_words foo bar baz'"
+puts "Outros exemplos:     'sum 1,2,3,4'"
+
 io = open_fifo_for_write
-io.sync = true   # saída imediata
+io.sync = true
+$stdout.sync = true
 
 count = 0
 loop do
@@ -63,20 +63,22 @@ loop do
   next if line.empty?
 
   payload = {
-    id: count += 1,
+    id:  (count += 1),
     raw: line,
-    ts: Time.now.utc.iso8601,
+    ts:  Time.now.utc.iso8601,
     rnd: rand(1..10_000)
   }
 
   begin
-    write_json_line(payload.to_json)
-    $stdout.puts "[enviado] #{payload}"
+    write_json_line(io, payload.to_json + "\n")  # <<< passa io e line
+    puts "[enviado] #{payload}"
   rescue Errno::EPIPE
-    warn "[produtor] consumidor fechou o pipe (EPIPE). tente iniciar o consumer e retomar."
+    warn "[produtor] consumidor fechou o pipe (EPIPE). reabrindo..."
     io = open_fifo_for_write
     io.sync = true
     retry
+  rescue Timeout::Error => e
+    warn "[produtor] #{e.message}; descartando esta linha"
   end
 end
 
