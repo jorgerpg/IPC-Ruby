@@ -3,7 +3,7 @@
 require "json"
 require "logger"
 
-$stdout.sync = true                                   # <<< PRINTA NA HORA NO TERMINAL
+$stdout.sync = true
 
 FIFO = "tmp/ipc_fifo"
 LOG  = Logger.new("logs/consumer.log", 10, 1024 * 1024)
@@ -18,8 +18,29 @@ end
 
 abort("FIFO não encontrado: #{FIFO}") unless File.pipe?(FIFO)
 
-$paused = false
-$processed = 0
+$paused     = false
+$shutdown   = false
+$processed  = 0
+$buffer     = []   # armazena mensagens quando pausado
+$max_buffer = 1000 # limite de segurança para não crescer indefinidamente
+
+Signal.trap("USR1") do
+  $paused = !$paused
+  puts $paused ? "[signal] USR1: consumidor PAUSADO" : "[signal] USR1: consumidor RETOMADO"
+end
+
+Signal.trap("USR2") do
+  dropped = $buffer.size
+  $buffer.clear
+  puts "[signal] USR2: buffer limpo (#{dropped} mensagens descartadas)"
+end
+
+["TERM", "INT"].each do |sig|
+  Signal.trap(sig) do
+    puts "[signal] #{sig}: encerramento solicitado"
+    $shutdown = true
+  end
+end
 
 def process_message(msg)
   raw = msg["raw"].to_s
@@ -62,24 +83,44 @@ def log_and_print(hash)
   puts "[proc] #{hash}"         # <<< COM $stdout.sync = true, sai na hora
 end
 
-File.open(FIFO, "r") do |io|
-  while (line = io.gets)
-    begin
-      msg = JSON.parse(line)
-      if $paused
-        log_and_print(kind: "paused", dropped: msg["raw"])
-        next
+def handle_line(line)
+  begin
+    msg = JSON.parse(line)
+    if $paused
+      if $buffer.size < $max_buffer
+        $buffer << msg
+        log_and_print(kind: "buffered", input: msg["raw"], size: $buffer.size)
+      else
+        log_and_print(kind: "buffer_overflow_drop", input: msg["raw"], size: $buffer.size)
       end
-
-      result = process_message(msg)
-      $processed += 1
-      log_and_print(id: msg["id"], ts: Time.now.utc.iso8601, input: msg["raw"], **result)
-    rescue JSON::ParserError
-      log_and_print(kind: "error", reason: "json_parse_error", line: line)
-    rescue => e
-      log_and_print(kind: "error", reason: e.class.name, message: e.message)
+      return
     end
+
+    result = process_message(msg)
+    $processed += 1
+    log_and_print(id: msg["id"], ts: Time.now.utc.iso8601, input: msg["raw"], **result)
+  rescue JSON::ParserError
+    log_and_print(kind: "error", reason: "json_parse_error", line: line)
+  rescue => e
+    log_and_print(kind: "error", reason: e.class.name, message: e.message)
   end
 end
 
+def drain_buffer
+  while !$buffer.empty? && !$paused
+    handle_line($buffer.shift.to_json)
+  end
+end
+
+File.open(FIFO, "r") do |io|
+  while !$shutdown
+    line = io.gets
+    break if line.nil? || $shutdown
+    handle_line(line)
+    drain_buffer unless $paused || $shutdown
+  end
+end
+
+# flush final
+drain_buffer unless $paused
 puts "Consumer finalizado. Processados: #{$processed}"
