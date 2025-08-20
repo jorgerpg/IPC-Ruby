@@ -4,6 +4,7 @@
 # --- Dependências ---
 require "json"    # Para interpretar as mensagens em formato JSON.
 require "logger"  # Para registrar as atividades em um arquivo de log.
+require "time"    # Para manipular e formatar datas e horas.
 
 # Garante que a saída para o console (puts) seja imediata, sem buffering.
 $stdout.sync = true
@@ -38,6 +39,7 @@ $max_buffer = 1000       # Limite de segurança para o buffer, para evitar consu
 Signal.trap("USR1") do
   $paused = !$paused
   puts $paused ? "[signal] USR1: consumidor PAUSADO" : "[signal] USR1: consumidor RETOMADO"
+  drain_buffer unless $paused || $shutdown
 end
 
 # Sinal USR2: Limpa o buffer de mensagens pendentes.
