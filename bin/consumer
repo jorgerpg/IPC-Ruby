@@ -98,6 +98,7 @@ def handle_line(line)
 
     result = process_message(msg)
     $processed += 1
+    sleep 1  # simula processamento lento
     log_and_print(id: msg["id"], ts: Time.now.utc.iso8601, input: msg["raw"], **result)
   rescue JSON::ParserError
     log_and_print(kind: "error", reason: "json_parse_error", line: line)
