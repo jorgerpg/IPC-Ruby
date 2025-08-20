@@ -1,66 +1,87 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-require "json"
-require "logger"
 
+# --- Dependências ---
+require "json"    # Para interpretar as mensagens em formato JSON.
+require "logger"  # Para registrar as atividades em um arquivo de log.
+
+# Garante que a saída para o console (puts) seja imediata, sem buffering.
 $stdout.sync = true
 
-FIFO = "tmp/ipc_fifo"
-LOG  = Logger.new("logs/consumer.log", 10, 1024 * 1024)
+# --- Constantes e Configuração ---
+FIFO = "tmp/ipc_fifo" # Caminho para o pipe nomeado (deve ser o mesmo do produtor).
+LOG  = Logger.new("logs/consumer.log", 10, 1024 * 1024) # Configura o logger para rotacionar arquivos.
 
-# tornar o arquivo de log síncrono também (sem buffer):
+# Hack para tornar o logger síncrono, garantindo que os logs sejam escritos imediatamente.
+# Útil para depuração em tempo real, evitando perda de logs se o programa falhar.
 begin
   logdev = LOG.instance_variable_get(:@logdev)
-  logdev.dev.sync = true if logdev && logdev.dev.respond_to?(:sync=)  # <<< LOG IMEDIATO
+  logdev.dev.sync = true if logdev && logdev.dev.respond_to?(:sync=)
 rescue
-  # ignora se a API interna do Logger mudar em outra versão
+  # Ignora erros caso a API interna do Logger mude em futuras versões do Ruby.
 end
 
+# Verifica se o FIFO existe, caso contrário, aborta.
 abort("FIFO não encontrado: #{FIFO}") unless File.pipe?(FIFO)
 
-$paused     = false
-$shutdown   = false
-$processed  = 0
-$buffer     = []   # armazena mensagens quando pausado
-$max_buffer = 1000 # limite de segurança para não crescer indefinidamente
+# --- Variáveis Globais de Estado ---
+$paused     = false      # Controla se o processamento está pausado.
+$shutdown   = false      # Indica se o programa deve ser encerrado.
+$processed  = 0          # Contador de mensagens processadas.
+$buffer     = []         # Armazena mensagens recebidas enquanto o consumidor está pausado.
+$max_buffer = 1000       # Limite de segurança para o buffer, para evitar consumo excessivo de memória.
 
+# --- Tratamento de Sinais ---
+
+# Sinal USR1: Pausa ou retoma o processamento.
+# `kill -USR1 <pid>` no terminal para acionar.
 Signal.trap("USR1") do
   $paused = !$paused
   puts $paused ? "[signal] USR1: consumidor PAUSADO" : "[signal] USR1: consumidor RETOMADO"
 end
 
+# Sinal USR2: Limpa o buffer de mensagens pendentes.
+# `kill -USR2 <pid>` no terminal para acionar.
 Signal.trap("USR2") do
   dropped = $buffer.size
   $buffer.clear
   puts "[signal] USR2: buffer limpo (#{dropped} mensagens descartadas)"
 end
 
+# Sinais TERM e INT: Solicitam o encerramento gracioso do programa.
+# Acionados por `kill <pid>` ou Ctrl+C.
 ["TERM", "INT"].each do |sig|
   Signal.trap(sig) do
     puts "[signal] #{sig}: encerramento solicitado"
-    $shutdown = true
+    $shutdown = true # Define a flag de encerramento, o loop principal irá parar.
   end
 end
 
-def process_message(msg)
-  raw = msg["raw"].to_s
+# --- Funções ---
 
+# Processa o conteúdo de uma mensagem.
+def process_message(msg)
+  raw = msg["raw"].to_s # Extrai a string bruta da mensagem.
+
+  # Tenta corresponder a uma expressão aritmética (ex: '10 + 5').
   if raw =~ /\A\s*(-?\d+(?:\.\d+)?)\s*([+\-*\/])\s*(-?\d+(?:\.\d+)?)\s*\z/
     a = $1.to_f; op = $2; b = $3.to_f
     result = case op
              when "+" then a + b
              when "-" then a - b
              when "*" then a * b
-             when "/" then (b.zero? ? Float::NAN : a / b)
+             when "/" then (b.zero? ? Float::NAN : a / b) # Evita divisão por zero.
              end
     return { kind: "arith", expr: raw, result: result }
   end
 
+  # Tenta corresponder a um comando de soma (ex: 'sum 1,2,3').
   if raw =~ /\Asum\s+([\d,\s\.]+)\z/i
     nums = $1.split(/[\s,]+/).reject(&:empty?).map!(&:to_f)
     return { kind: "sum", list: nums, result: nums.sum }
   end
 
+  # Comandos de manipulação de string.
   if raw =~ /\Aupper\s+(.+)\z/i
     return { kind: "upper", from: $1, result: $1.upcase }
   end
@@ -75,60 +96,79 @@ def process_message(msg)
     return { kind: "count_words", from: $1, result: words.size }
   end
 
+  # Se nenhum padrão corresponder, retorna como 'unknown'.
   { kind: "unknown", raw: raw }
 end
 
+# Escreve a saída no log e na tela.
 def log_and_print(hash)
-  LOG.info(hash)
-  puts "[proc] #{hash}"         # <<< COM $stdout.sync = true, sai na hora
+  LOG.info(hash)      # Escreve a estrutura de dados no arquivo de log.
+  puts "[proc] #{hash}" # Imprime a mesma estrutura no console.
 end
 
+# Lida com uma linha (mensagem JSON) recebida do produtor.
 def handle_line(line)
   begin
-    msg = JSON.parse(line)
+    msg = JSON.parse(line) # Tenta decodificar a string JSON para um Hash.
     if $paused
+      # Se o consumidor estiver pausado, armazena a mensagem no buffer.
       if $buffer.size < $max_buffer
         $buffer << msg
         log_and_print(kind: "buffered", input: msg["raw"], size: $buffer.size)
       else
+        # Se o buffer estiver cheio, descarta a mensagem para evitar usar muita memória.
         log_and_print(kind: "buffer_overflow_drop", input: msg["raw"], size: $buffer.size)
       end
-      return
+      return # Não processa a mensagem agora.
     end
 
+    # Se não estiver pausado, processa a mensagem.
     result = process_message(msg)
     $processed += 1
-    sleep 1  # simula processamento lento
+    sleep 1 # Simula um processamento demorado.
     log_and_print(id: msg["id"], ts: Time.now.utc.iso8601, input: msg["raw"], **result)
-  rescue JSON::ParserError
+  rescue JSON::ParserError # Lida com JSON malformado.
     log_and_print(kind: "error", reason: "json_parse_error", line: line)
-  rescue => e
+  rescue => e # Lida com outros erros inesperados durante o processamento.
     log_and_print(kind: "error", reason: e.class.name, message: e.message)
   end
 end
 
+# Processa as mensagens que foram armazenadas no buffer.
 def drain_buffer
+  # Continua enquanto o buffer tiver itens E o consumidor não estiver pausado.
   while !$buffer.empty? && !$paused
+    # Remove o primeiro item do buffer e o envia para 'handle_line'.
+    # A mensagem é reconvertida para JSON para manter a consistência do fluxo.
     handle_line($buffer.shift.to_json)
   end
 end
 
+# --- Lógica Principal ---
+
+# Abre o FIFO para leitura. O bloco garante que o arquivo será fechado ao final.
 File.open(FIFO, "r") do |io|
-  io.sync = true # garante que a leitura seja imediata
-  # loop responsivo a sinais: checa $shutdown a cada ~200ms
+  io.sync = true # Garante que as leituras do pipe sejam imediatas.
+
+  # Loop principal: continua rodando até que a flag $shutdown seja verdadeira.
   while !$shutdown
-    # espera até 0.2s por dados; se nada chegar, volta e checa $shutdown
+    # IO.select espera por dados no pipe por até 0.2 segundos.
+    # Isso torna o loop responsivo: ele não fica bloqueado esperando por dados
+    # e pode verificar a flag $shutdown regularmente.
     readable, = IO.select([io], nil, nil, 0.2)
 
     if readable
+      # Se houver dados para ler, lê uma linha.
       line = io.gets
-      break if line.nil? || $shutdown  # writer fechou ou sinal chegou
+      # Interrompe se a linha for nula (produtor fechou o pipe) ou se um sinal de encerramento foi recebido.
+      break if line.nil? || $shutdown
       handle_line(line)
+      # Após processar uma nova mensagem, tenta esvaziar o buffer se não estiver pausado.
       drain_buffer unless $paused || $shutdown
     end
   end
 end
 
-# flush final
+# Após o loop principal (quando $shutdown é true), tenta esvaziar o buffer uma última vez.
 drain_buffer unless $paused
 puts "Consumer finalizado. Processados: #{$processed}"

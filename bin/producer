@@ -1,91 +1,131 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-require "json"
-require "time"
-require "timeout"
 
+# --- Dependências ---
+require "json"      # Para codificar os dados em formato JSON.
+require "time"      # Para obter timestamps em formato ISO8601.
+require "timeout"   # Para lidar com esperas excessivas na escrita.
+
+# --- Constantes ---
+# Define o caminho para o arquivo FIFO (pipe nomeado) que será usado para a comunicação.
 FIFO = "tmp/ipc_fifo"
+
+# --- Validação Inicial ---
+# Verifica se o arquivo FIFO existe e é um pipe. Se não for, o programa é abortado.
 abort("FIFO não encontrado: #{FIFO}") unless File.pipe?(FIFO)
 
+# --- Tratamento de Sinais ---
+# Captura o sinal 'PIPE', que ocorre se o consumidor fechar a ponta de leitura do pipe.
+# Isso evita que o produtor quebre abruptamente e, em vez disso, exibe uma mensagem clara.
 trap("PIPE") do
   abort "[produtor] pipe quebrado (consumer fechou). Encerrando."
 end
 
-# Abre o FIFO para escrita com retentativa se não houver consumidor ainda.
+# --- Funções ---
+
+# Tenta abrir o FIFO para escrita.
+# Como o consumidor pode ainda não estar escutando, ele tenta várias vezes antes de desistir.
 def open_fifo_for_write
   tries = 0
   begin
-    File.open(FIFO, File::WRONLY | File::NONBLOCK)   # já está não-bloqueante
-  rescue Errno::ENXIO, Errno::EPIPE
+    # Abre o arquivo em modo de escrita (WRONLY) e não-bloqueante (NONBLOCK).
+    # O modo não-bloqueante é crucial para evitar que o produtor trave aqui se não houver um leitor.
+    File.open(FIFO, File::WRONLY | File::NONBLOCK)
+  rescue Errno::ENXIO, Errno::EPIPE # Erros comuns quando não há leitor.
     tries += 1
     warn "[produtor] sem leitor ainda... tentativa #{tries}"
-    sleep 0.5
-    retry if tries < 10
+    sleep 0.5  # Espera um pouco antes de tentar novamente.
+    retry if tries < 10 # Tenta novamente até 10 vezes.
+    # Se exceder as tentativas, aborta o programa.
     abort "[produtor] não há leitor (consumer); abortando após #{tries} tentativas."
   end
 end
 
-# Escreve sem bloquear; espera o pipe ficar disponível quando estiver cheio.
+# Escreve uma linha JSON no pipe de forma não-bloqueante.
+# Se o buffer do pipe estiver cheio, ele espera um tempo limitado.
 def write_json_line(io, line, timeout: 1.0, max_retries: 5)
-  pending = line.dup
+  pending = line.dup # Cria uma cópia da linha para poder modificar.
   retries = 0
 
   loop do
     begin
+      # Tenta escrever os dados pendentes sem bloquear.
       written = io.write_nonblock(pending)
+      # Se o número de bytes escritos for igual ao tamanho total, a escrita foi bem-sucedida.
       return if written == pending.bytesize
+      # Se a escrita foi parcial, atualiza a string 'pending' para conter apenas o que falta.
       pending = pending.byteslice(written..-1)
-    rescue IO::WaitWritable, Errno::EAGAIN
+    rescue IO::WaitWritable, Errno::EAGAIN # Erro que indica que o pipe está cheio.
       warn "[produtor] pipe cheio; aguardando disponibilidade..."
+      # Usa IO.select para esperar que o 'io' (pipe) se torne disponível para escrita.
+      # O timeout evita que o programa fique bloqueado indefinidamente.
       ready = IO.select(nil, [io], nil, timeout)
       unless ready
+        # Se o timeout for atingido, incrementa o contador de retentativas.
         retries += 1
         warn "[produtor] ainda bloqueado (tentativa #{retries}/#{max_retries})"
+        # Se o número máximo de retentativas for atingido, lança um erro.
         raise Timeout::Error, "timeout escrevendo no pipe" if retries >= max_retries
       end
+      # Tenta a escrita novamente.
       retry
     end
   end
 end
 
+# --- Lógica Principal ---
+
+# Imprime as instruções de uso para o usuário.
 puts "== Produtor (digite uma mensagem por linha; 'quit' para sair) =="
 puts "Exemplos numéricos:  '12 + 5', '7*3', '10 / 2', '9 - 4'"
 puts "Exemplos string:     'upper Olá mundo', 'reverse abc', 'count_words foo bar baz'"
 puts "Outros exemplos:     'sum 1,2,3,4'"
 
+# Abre o FIFO e prepara para a escrita.
 io = open_fifo_for_write
+# Garante que os dados sejam escritos imediatamente no pipe, sem buffering interno.
 io.sync = true
+# Garante que a saída para o console (STDOUT) também seja imediata.
 $stdout.sync = true
 
-count = 0
+count = 0 # Contador para o ID de cada mensagem.
 loop do
-  print "> "
-  line = STDIN.gets
+  print "> " # Prompt para o usuário.
+  line = STDIN.gets # Lê uma linha da entrada do usuário.
+
+  # Condições de saída do loop:
+  # 1. Se `gets` retornar nil (fim da entrada, como Ctrl+D).
   break if line.nil?
 
-  line = line.strip
+  line = line.strip # Remove espaços em branco do início e do fim.
+  # 2. Se o usuário digitar 'quit'.
   break if line.downcase == "quit"
+  # 3. Se a linha estiver vazia, ignora e pede a próxima.
   next if line.empty?
 
+  # Monta o payload (carga de dados) como um hash Ruby.
   payload = {
-    id:  (count += 1),
-    raw: line,
-    ts:  Time.now.utc.iso8601,
-    rnd: rand(1..10_000)
+    id:  (count += 1),                # ID sequencial.
+    raw: line,                        # O comando bruto digitado pelo usuário.
+    ts:  Time.now.utc.iso8601,        # Timestamp universal.
+    rnd: rand(1..10_000)              # Um número aleatório.
   }
 
   begin
-    write_json_line(io, payload.to_json + "\n")  # <<< passa io e line
+    # Converte o hash para uma string JSON, adiciona uma nova linha e envia para o consumidor.
+    write_json_line(io, payload.to_json + "\n")
     puts "[enviado] #{payload}"
-  rescue Errno::EPIPE
+  rescue Errno::EPIPE # Erro que acontece se o consumidor fechar o pipe inesperadamente.
     warn "[produtor] consumidor fechou o pipe (EPIPE). reabrindo..."
-    io = open_fifo_for_write
+    io = open_fifo_for_write # Tenta reabrir a conexão.
     io.sync = true
-    retry
-  rescue Timeout::Error => e
+    retry # Tenta reenviar a mesma mensagem.
+  rescue Timeout::Error => e # Erro lançado por 'write_json_line' se houver timeout.
     warn "[produtor] #{e.message}; descartando esta linha"
+    # A mensagem é descartada e o loop continua.
   end
 end
 
+# Fecha o pipe se ele não estiver fechado.
 io.close unless io.closed?
 puts "Produtor finalizado."
