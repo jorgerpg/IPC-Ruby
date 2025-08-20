@@ -1,48 +1,36 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# --- Dependências ---
-require "json"      # Para codificar os dados em formato JSON.
-require "time"      # Para obter timestamps em formato ISO8601.
-require "timeout"   # Para lidar com esperas excessivas na escrita.
+require "json"      # Codificação de mensagens
+require "time"      # Timestamps em formato ISO 8601
+require "timeout"   # Controle de tempo de espera na escrita
 
-# --- Constantes ---
-# Define o caminho para o arquivo FIFO (pipe nomeado) que será usado para a comunicação.
+# Caminho do pipe nomeado usado para comunicação
 FIFO = "tmp/ipc_fifo"
 
-# --- Validação Inicial ---
-# Verifica se o arquivo FIFO existe e é um pipe. Se não for, o programa é abortado.
+# Verifica se o pipe existe antes de iniciar
 abort("FIFO não encontrado: #{FIFO}") unless File.pipe?(FIFO)
 
-# --- Tratamento de Sinais ---
-# Captura o sinal 'PIPE', que ocorre se o consumidor fechar a ponta de leitura do pipe.
-# Isso evita que o produtor quebre abruptamente e, em vez disso, exibe uma mensagem clara.
+# Sinal PIPE: evita falha se o consumidor fechar o pipe
 trap("PIPE") do
   abort "[produtor] pipe quebrado (consumer fechou). Encerrando."
 end
 
-# --- Funções ---
-
-# Tenta abrir o FIFO para escrita.
-# Como o consumidor pode ainda não estar escutando, ele tenta várias vezes antes de desistir.
+# Tenta abrir o pipe para escrita, com múltiplas tentativas
 def open_fifo_for_write
   tries = 0
   begin
-    # Abre o arquivo em modo de escrita (WRONLY) e não-bloqueante (NONBLOCK).
-    # O modo não-bloqueante é crucial para evitar que o produtor trave aqui se não houver um leitor.
     File.open(FIFO, File::WRONLY | File::NONBLOCK)
-  rescue Errno::ENXIO, Errno::EPIPE # Erros comuns quando não há leitor.
+  rescue Errno::ENXIO, Errno::EPIPE
     tries += 1
     warn "[produtor] sem leitor ainda... tentativa #{tries}"
-    sleep 0.5  # Espera um pouco antes de tentar novamente.
-    retry if tries < 10 # Tenta novamente até 10 vezes.
-    # Se exceder as tentativas, aborta o programa.
+    sleep 0.5
+    retry if tries < 10
     abort "[produtor] não há leitor (consumer); abortando após #{tries} tentativas."
   end
 end
 
-# Escreve uma linha JSON no pipe de forma não-bloqueante.
-# Se o buffer do pipe estiver cheio, ele espera um tempo limitado.
+# Escreve uma linha JSON no pipe, lidando com bloqueios e timeouts
 def write_json_line(io, line, timeout: 1.0, max_retries: 5)
   pending = line.dup # Cria uma cópia da linha para poder modificar.
   retries = 0
@@ -73,37 +61,30 @@ def write_json_line(io, line, timeout: 1.0, max_retries: 5)
   end
 end
 
-# --- Lógica Principal ---
-
-# Imprime as instruções de uso para o usuário.
+# Instruções para o usuário
 puts "== Produtor (digite uma mensagem por linha; 'quit' para sair) =="
 puts "Exemplos numéricos:  '12 + 5', '7*3', '10 / 2', '9 - 4'"
 puts "Exemplos string:     'upper Olá mundo', 'reverse abc', 'count_words foo bar baz'"
 puts "Outros exemplos:     'sum 1,2,3,4'"
 
-# Abre o FIFO e prepara para a escrita.
+# Prepara o pipe para escrita
 io = open_fifo_for_write
-# Garante que os dados sejam escritos imediatamente no pipe, sem buffering interno.
 io.sync = true
-# Garante que a saída para o console (STDOUT) também seja imediata.
 $stdout.sync = true
 
-count = 0 # Contador para o ID de cada mensagem.
-loop do
-  print "> " # Prompt para o usuário.
-  line = STDIN.gets # Lê uma linha da entrada do usuário.
+count = 0
 
-  # Condições de saída do loop:
-  # 1. Se `gets` retornar nil (fim da entrada, como Ctrl+D).
+# Loop principal de leitura do terminal
+loop do
+  print "> "
+  line = STDIN.gets
   break if line.nil?
 
-  line = line.strip # Remove espaços em branco do início e do fim.
-  # 2. Se o usuário digitar 'quit'.
+  line = line.strip
   break if line.downcase == "quit"
-  # 3. Se a linha estiver vazia, ignora e pede a próxima.
   next if line.empty?
 
-  # Monta o payload (carga de dados) como um hash Ruby.
+  # Monta a mensagem a ser enviada
   payload = {
     id:  (count += 1),                # ID sequencial.
     raw: line,                        # O comando bruto digitado pelo usuário.
@@ -112,17 +93,15 @@ loop do
   }
 
   begin
-    # Converte o hash para uma string JSON, adiciona uma nova linha e envia para o consumidor.
     write_json_line(io, payload.to_json + "\n")
     puts "[enviado] #{payload}"
   rescue Errno::EPIPE # Erro que acontece se o consumidor fechar o pipe inesperadamente.
     warn "[produtor] consumidor fechou o pipe (EPIPE). reabrindo..."
-    io = open_fifo_for_write # Tenta reabrir a conexão.
+    io = open_fifo_for_write
     io.sync = true
     retry # Tenta reenviar a mesma mensagem.
   rescue Timeout::Error => e # Erro lançado por 'write_json_line' se houver timeout.
     warn "[produtor] #{e.message}; descartando esta linha"
-    # A mensagem é descartada e o loop continua.
   end
 end
 
