@@ -10,7 +10,7 @@ abort("FIFO não encontrado: #{FIFO}") unless File.pipe?(FIFO)
 def open_fifo_for_write
   tries = 0
   begin
-    File.open(FIFO, "w")
+    File.open(FIFO, File::WRONLY | File::NONBLOCK)
   rescue Errno::ENXIO, Errno::EPIPE
     tries += 1
     warn "[produtor] sem leitor ainda... tentativa #{tries}"
