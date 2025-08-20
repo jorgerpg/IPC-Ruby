@@ -2,15 +2,20 @@
 # frozen_string_literal: true
 require "json"
 require "time"
+require "timeout"
 
 FIFO = "tmp/ipc_fifo"
 abort("FIFO não encontrado: #{FIFO}") unless File.pipe?(FIFO)
+
+trap("PIPE") do
+  abort "[produtor] pipe quebrado (consumer fechou). Encerrando."
+end
 
 # Abre o FIFO para escrita com retentativa se não houver consumidor ainda.
 def open_fifo_for_write
   tries = 0
   begin
-    File.open(FIFO, File::WRONLY | File::NONBLOCK)
+    File.open(FIFO, File::WRONLY | File::NONBLOCK)   # já está não-bloqueante
   rescue Errno::ENXIO, Errno::EPIPE
     tries += 1
     warn "[produtor] sem leitor ainda... tentativa #{tries}"
